@@ -1,0 +1,12 @@
+# 原始数据、预处理缓存和合成数据均不进入版本库
+data/
+synthetic/
+*.f32
+*.jsonl
+
+# 训练结果、模型权重和图表均由本地运行生成
+experiments/
+
+# Python 本地缓存
+__pycache__/
+*.py[cod]
