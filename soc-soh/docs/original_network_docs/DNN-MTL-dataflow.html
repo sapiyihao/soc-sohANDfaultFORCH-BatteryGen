@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>DNN-MTL 架构全景图</title>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+<style>
+  body { background: #fafafa; margin: 0; padding: 20px; font-family: "Microsoft YaHei", sans-serif; }
+  h1 { text-align: center; font-size: 20px; margin-bottom: 5px; }
+  p.sub { text-align: center; color: #666; font-size: 13px; margin-bottom: 25px; }
+  .mermaid { display: flex; justify-content: center; margin-bottom: 30px; }
+  .legend { max-width: 1000px; margin: 30px auto; font-size: 12px; color: #555; border-top: 1px solid #ddd; padding-top: 15px; }
+  .legend table { border-collapse: collapse; width: 100%; }
+  .legend td { padding: 3px 8px; vertical-align: top; }
+  .legend b { color: #333; }
+</style>
+</head>
+<body>
+<h1>DNN-MTL 架构全景图</h1>
+<p class="sub">马钢混动机车 8 支路并联电池组 | 10Hz 推理 | 层级特定约束 + Star Op + 不确定性加权 | ~1.22M 参数</p>
+
+<!-- ==================== 图一：全景数据流 ==================== -->
+<div class="mermaid">
+%%{init: {'theme':'base', 'themeVariables': { 'primaryColor':'#e3edf7','primaryTextColor':'#222','primaryBorderColor':'#8899bb','lineColor':'#556677','secondaryColor':'#f0f4c0','tertiaryColor':'#ffe0c0','fontSize':'12px'}}}%%
+flowchart TB
+    subgraph CAN["CAN 总线 (每 100ms 一帧, 10Hz)"]
+        direction LR
+        D1["8 条支路 BMS3~BMS8<br/>V总 / Vmax / Vmin<br/>I总 / Tmax / Tmin"]
+        D3["工况上下文<br/>充电工况 / 混动工况<br/>里程 / 环境温度"]
+    end
+
+    CAN --> PREPROC["数据预处理管线"]
+    
+    subgraph PREPROC_BOX["Step 1~6: 数据预处理"]
+        direction TB
+        PREPROC["① 字段提取与校验<br/>② 滑动窗口 W=128 环形缓冲<br/>③ 缺失值填充 / 尖峰剔除<br/>④ Z-score 归一化<br/>⑤ 工况识别 (充电/放电/静置)<br/>⑥ SOH 锚点 EMA 更新"]
+    end
+
+    PREPROC -->|"[batch,128,6]"| TCN_IN
+    PREPROC -->|"[batch,5] 上下文"| CTX_IN
+
+    subgraph ENCODER["共享编码器 (8 支路共享权重, batch=8 并行)"]
+        direction TB
+        TCN_IN["时序输入 [8,128,6]"]
+        TCN["TCN 时序编码器<br/>4 层空洞因果卷积<br/>膨胀率 [1,2,4,8]<br/>kernel=5, 64ch<br/>+ GAP + FC(64→128)"]
+        TCN_IN --> TCN
+        TCN --> TCN_OUT["TCN 特征 [8,128]"]
+
+        CTX_IN["上下文输入 [8,5]"]
+        CTX["上下文编码器<br/>FC(5→32→64)<br/>+ LayerNorm + GELU"]
+        CTX_IN --> CTX
+        CTX --> CTX_OUT["上下文特征 [8,64]"]
+    end
+
+    TCN_OUT --> CONCAT
+    CTX_OUT --> CONCAT
+    EMB["支路嵌入 E ∈ R^{8×32}<br/>(可学习, 编码位置角色)"]
+    EMB --> CONCAT
+
+    CONCAT["拼接 + 投影<br/>[128|64|32] = [224]<br/>FC(224→256) + GELU<br/>→ 共享特征 Z [8,256]"]
+
+    CONCAT --> ATTENTION
+    CONCAT -->|"浅层出口 Z"| SOC_H
+
+    subgraph ATTENTION_BOX["交叉支路自注意力"]
+        direction TB
+        ATTENTION["Multi-Head Self-Attention<br/>4 头 × 64 维<br/>8 条支路互相关注<br/><br/>输出: Z' [8,256]<br/>+ 注意力权重矩阵"]
+    end
+
+    ATTENTION -->|"深层出口 Z'"| SOH_H
+
+    subgraph BRANCH_BOX["层级特定双分支 + Star Operation"]
+        direction LR
+        SOC_H["SOC 分支 (浅层)<br/>FC(256→128) + GELU<br/>→ F_soc [128]<br/>对瞬时波动敏感"]
+        SOH_H["SOH 分支 (深层)<br/>FC(256→128) + GELU<br/>→ F_soh [128]<br/>含支路间退化对比"]
+    end
+
+    SOC_H --> STAR
+    SOH_H --> STAR
+
+    STAR["⭐ Star Operation<br/>F_star = F_soc ⊙ F_soh<br/>FC(128→128) + GELU<br/>浅层×深层乘积耦合"]
+
+    STAR --> SOC_OUT["SOC 输出<br/>FC(128→64) + GELU<br/>FC(64→1) + Sigmoid<br/>→ 8×SOC 10Hz"]
+    STAR --> SOH_OUT["SOH 输出<br/>FC(128→64) + GELU<br/>FC(64→1) + Sigmoid<br/>→ 8×SOH 仅充电"]
+
+    SOC_OUT --> PACK
+    SOH_OUT --> PACK
+
+    SOC_OUT -.->|"MC Dropout T=20"| SIGMA["±σ 置信区间"]
+    SOH_OUT -.-> SIGMA
+
+    SIGMA --> PACK
+
+    subgraph PACK_BOX["Pack 级聚合"]
+        direction TB
+        PACK["SOC_pack = Σ(w_i·SOC_i)/Σw_i (w=SOH)<br/>SOH_pack = min(SOH_i)<br/>支路偏差检测 + 注意力权重分析<br/>σ_pack = 加权传播"]
+    end
+
+    PACK --> OUTPUT
+
+    subgraph OUTPUT_BOX["CAN 输出 (每 100ms)"]
+        direction LR
+        OUTPUT["<b>Pack SOC</b> + 8 支路 SOC<br/><b>Pack SOH</b> + 8 支路 SOH<br/><b>置信区间</b> ±σ"]
+    end
+
+    style CAN fill:#e8e8ff
+    style PREPROC_BOX fill:#f5f5f5
+    style ENCODER fill:#e3edf7
+    style ATTENTION_BOX fill:#fff3e0
+    style BRANCH_BOX fill:#e8f5e8
+    style PACK_BOX fill:#f3e5f5
+    style OUTPUT_BOX fill:#e0f2f1
+</div>
+
+<!-- ==================== 图二：物理损失体系 ==================== -->
+<div class="mermaid">
+%%{init: {'theme':'base', 'themeVariables': { 'primaryColor':'#e3edf7','primaryTextColor':'#222','primaryBorderColor':'#8899bb','lineColor':'#556677','fontSize':'14px'}}}%%
+flowchart LR
+    subgraph LOSS["物理约束损失函数体系 (仅训练时生效)"]
+        direction LR
+        
+        subgraph TASK["L_task 监督任务损失"]
+            L_SOC["L_SOC = Huber(SOC_pred, SOC_label)<br/>α=1.0"]
+            L_SOH["L_SOH = Huber(SOH_pred, SOH_label)<br/>β=0.5 仅充电"]
+        end
+
+        subgraph PHYS["L_physics 物理耦合"]
+            L_PHY["Huber(ΔSOC·SOH·C_nom , η·∫I·dt)<br/>↑ 网络输出 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; ↑ 电流传感器积分<br/>梯度同时流向 SOC 和 SOH"]
+        end
+
+        subgraph CONS["L_consistency 电压一致性"]
+            L_CONS["Huber(V_measured , OCV(SOC)+I·R₀)<br/>↑ 真实读数 &nbsp;&nbsp;&nbsp; ↑ 仅依赖 SOC<br/>OCV 单调 → SOC 锚定于物理现实"]
+        end
+
+        subgraph MONO["L_monotonicity"]
+            L_MONO["max(0, SOH(t+1)−SOH(t)+0.005)"]
+        end
+    end
+
+    style TASK fill:#e8f5e8
+    style PHYS fill:#fff3e0
+    style CONS fill:#e3f2fd
+    style MONO fill:#f3e5f5
+</div>
+
+<!-- ==================== 图二-B：物理损失梯度链 ==================== -->
+<div class="mermaid">
+%%{init: {'theme':'base', 'themeVariables': { 'primaryColor':'#e3edf7','primaryTextColor':'#222','primaryBorderColor':'#8899bb','lineColor':'#556677','fontSize':'14px'}}}%%
+flowchart TB
+    V["V_measured<br/>(传感器真实读数)"] -->|"L_consistency"| SOC["SOC_pred 被锚定"]
+    SOC -->|"SOC 接近真值"| DELTA["ΔSOC_pred ≈ 真 ΔSOC"]
+    I["∫I·dt<br/>(电流传感器积分)"] -->|"L_physics<br/>独立物理锚点"| DELTA
+    DELTA -->|"强制匹配"| SOH["SOH_pred 被迫修正"]
+    
+    L_TOTAL["L_total = L_task + 0.1·L_physics + 0.05·L_consistency + 0.01·L_monotonicity"]
+
+    style V fill:#e3f2fd
+    style SOC fill:#e8f5e8
+    style DELTA fill:#fff3e0
+    style I fill:#e3f2fd
+    style SOH fill:#f3e5f5
+    style L_TOTAL fill:#fce4ec
+</div>
+
+<!-- ==================== 图三：训练标签构造 ==================== -->
+<div class="mermaid">
+%%{init: {'theme':'base', 'themeVariables': { 'primaryColor':'#e3edf7','primaryTextColor':'#222','primaryBorderColor':'#8899bb','lineColor':'#556677','fontSize':'12px'}}}%%
+flowchart TB
+    subgraph LABELS["训练标签构造 (离线, 每条支路独立)"]
+        direction TB
+
+        subgraph SOC_LAB["SOC 标签: OCV 锚点 + 安时积分"]
+            direction TB
+            REST["长静置段检测<br/>|I|<0.5A 持续>1h"]
+            ANCHOR["OCV⁻¹(V_rest) → SOC_anchor<br/>(离线 OCV 曲线查表)"]
+            COULOMB["SOC(t) = SOC_anchor + η·∫I·dt / C_nom<br/>(锚点之间安时积分填充)"]
+            DRIFT["锚点间漂移修正<br/>drift 按时间线性分配"]
+            QUALITY["质量分级: A(±1~2%) / B(±3~5%) / C(±5~10%)<br/>训练权重: 1.0 / 0.7 / 0.3"]
+            REST --> ANCHOR --> COULOMB --> DRIFT --> QUALITY
+        end
+
+        subgraph SOH_LAB["SOH 标签: 充电片段容量反推"]
+            direction TB
+            CHARGE["有效充电片段筛选<br/>地面充电=1, ΔSOC>30%<br/>首尾各有静置锚点"]
+            CAP["C_current = ∫I·dt / ΔSOC<br/>SOH = C_current / C_nom"]
+            SHARE["片段内所有帧共享同一 SOH_label<br/>各支路独立计算"]
+            CHARGE --> CAP --> SHARE
+        end
+    end
+
+    style SOC_LAB fill:#e8f5e8
+    style SOH_LAB fill:#fff3e0
+</div>
+
+<!-- ==================== 图四：OCV 在线自校准 ==================== -->
+<div class="mermaid">
+%%{init: {'theme':'base', 'themeVariables': { 'primaryColor':'#e3edf7','primaryTextColor':'#222','primaryBorderColor':'#8899bb','lineColor':'#556677','fontSize':'12px'}}}%%
+flowchart LR
+    subgraph OCV["OCV 老化五层在线自校准 (无需定期重标定)"]
+        direction TB
+        
+        L1["<b>第一层: 冷启动</b><br/>样本 < 20 组<br/>原始 OCV + λ2 指数衰减<br/>BMS SOC 弱锚定 (λ=0.02)<br/>每出现静置段 → 收集样本"]
+        L2["<b>第二层: δ(SOC) 在线拟合</b><br/>样本 ≥ 20 组<br/>ΔV = V_rest − OCV(SOC_ref)<br/>3 阶多项式拟合 δ(SOC)<br/>OCV_corrected = OCV + δ<br/>λ2 恢复满权重"]
+        L3["<b>第三层: 持续迭代</b><br/>每 +10 组重拟合<br/>良性循环:<br/>δ 更新 → 锚点更准<br/>→ SOC_ref 更准 → δ 更准"]
+        L4["<b>第四层: 8 支路冗余</b><br/>取 8 条 ΔV 中位数拟合<br/>单支路异常自动滤除<br/>样本积累速度 ×8"]
+        L5["<b>第五层: 退化兜底</b><br/>|δ|>50mV → 回退<br/>C 级样本降权 ×0.3<br/>60天无静置 → λ2→0"]
+        
+        L1 --> L2 --> L3
+        L4 -.->|"8 条 ΔV 中位数"| L2
+        L5 -.->|"异常保护"| L2
+        L5 -.->|"异常保护"| L3
+    end
+
+    style L1 fill:#e8f5e8
+    style L2 fill:#fff3e0
+    style L3 fill:#e3f2fd
+    style L4 fill:#f3e5f5
+    style L5 fill:#fce4ec
+</div>
+
+<div class="legend">
+<table>
+<tr><td colspan="2"><b>图例</b></td></tr>
+<tr><td width="50%">
+<b>图一 (全景数据流)</b> — 从 CAN 总线到最终输出的完整推理管线。<br/>
+8 条支路数据经过 6 步预处理后, 同时进入共享 TCN 和上下文编码器 (权重全共享)。<br/>
+拼接支路嵌入后投影到 256 维共享特征空间, 经交叉支路自注意力互相对比。<br/>
+层级特定约束：SOC 从浅层 Z（交叉注意力前）取特征，SOH 从深层 Z'（交叉注意力后）取特征，<br/>Star Operation 在 128 维处做乘积耦合，训练损失由可学习 σ_soc/σ_soh 自动加权。<br/>
+最后经 Pack 级聚合输出。
+</td><td width="50%">
+<b>图二 (物理损失分解)</b> — 三个损失函数的公式和角色。<br/>
+L_task: 两类监督标签的 Huber 损失。<br/>
+L_physics (修正形式): ∫I·dt (电流传感器积分) 作为独立物理锚点，同时约束 SOC 和 SOH。<br/>
+L_consistency: V_measured (传感器真实读数) 通过 OCV 曲线锚定 SOC。<br/>
+L_monotonicity: 强制 SOH 单调递减。<br/>
+<br/><b>图二-B (梯度链)</b> — V_measured → L_consistency → SOC_pred 锚定 → ΔSOC_pred 接近真值 → L_physics 用 ∫I·dt 做独立锚点 → SOH_pred 被迫修正。<br/>
+三者互补打破"两个预测量互相对答案"的循环依赖。
+</td></tr>
+<tr><td>
+<b>图三 (训练标签构造)</b> — 两类标签均从可获取物理量间接构造。<br/>
+SOC: 静置 OCV 锚点 + 安时积分, 三级质量加权。<br/>
+SOH: 充电片段容量反推, 片段内共享。
+</td><td>
+<b>图四 (OCV 在线自校准)</b> — 五层递进策略, 无需受控重标定。<br/>
+利用自然静置段收集 (SOC_ref, V_rest) 样本, 3 阶多项式在线拟合 OCV 老化偏移 δ(SOC)。<br/>
+8 支路中位数抗噪, 持续迭代形成良性循环, 异常时退化兜底。
+</td></tr>
+</table>
+</div>
+
+<script>
+mermaid.initialize({startOnLoad:true, theme:'base', securityLevel:'loose'});
+</script>
+</body>
+</html>
